@@ -11,24 +11,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("alerts.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),  # Print logs to console
+        logging.FileHandler("alerts.log", encoding="utf-8"),  # Save logs to file
     ],
 )
 logger = logging.getLogger(__name__)
 
 # ================= Globals =================
-ALERT_THRESHOLD = 1000  # Payload length threshold for alerts
-PACKET_COUNT = 0
-ALERT_COUNT = 0
-MODEL_PATH = "rf_payload_model.joblib"  # Đường dẫn tới file model
-MODEL_EXPECTED_FEATURES = None
+ALERT_THRESHOLD = (
+    1000  # If payload length > 1000 bytes, trigger a simple rule-based alert
+)
+PACKET_COUNT = 0  # Count of all sniffed packets
+ALERT_COUNT = 0  # Count of triggered alerts
+MODEL_PATH = "rf_payload_model.joblib"  # Path to the trained ML model
+MODEL_EXPECTED_FEATURES = None  # Number of features model expects
 model = None
 scaler = None
 
 
 # ================= Load Model =================
 def load_model():
+    """
+    Load the trained ML model and optional scaler from a joblib file.
+    The joblib file should contain a dictionary with keys like 'model' and 'scaler'.
+    """
     global model, scaler, MODEL_EXPECTED_FEATURES
     try:
         saved = joblib.load(MODEL_PATH)
@@ -36,6 +42,7 @@ def load_model():
         scaler = saved.get("scaler", None)
         logger.info(f"✅ Model loaded: {MODEL_PATH}")
 
+        # Determine how many features the model expects
         if hasattr(model, "n_features_in_"):
             MODEL_EXPECTED_FEATURES = int(model.n_features_in_)
         elif hasattr(model, "feature_names_in_"):
@@ -47,9 +54,12 @@ def load_model():
         scaler = None
 
 
-# ================= Packet Callback =================
+# ================= Feature Extraction =================
 def extract_features(packet):
-    """Trích xuất đặc trưng từ gói tin"""
+    """
+    Extract features from a network packet.
+    Returns a dictionary with source IP, destination IP, protocol, and payload length.
+    """
     feats = {"src_ip": "0.0.0.0", "dst_ip": "0.0.0.0", "protocol": 0, "payload_len": 0}
     if packet.haslayer(IP):
         feats["src_ip"] = packet[IP].src
@@ -60,47 +70,50 @@ def extract_features(packet):
     return feats
 
 
+# ================= Packet Callback =================
 def packet_callback(packet):
-    """Xử lý gói tin khi bắt được"""
+    """
+    This function is called for each sniffed packet.
+    It extracts features, applies threshold-based detection, and uses ML model if available.
+    """
     global PACKET_COUNT, ALERT_COUNT
     PACKET_COUNT += 1
 
-    # Trích xuất đặc trưng
+    # Extract features
     feats = extract_features(packet)
     src_ip = feats["src_ip"]
     dst_ip = feats["dst_ip"]
     protocol = feats["protocol"]
     payload_len = feats["payload_len"]
 
-    # Log thông tin gói tin
-    logger.info(
-        f"Packet {PACKET_COUNT}: {src_ip} -> {dst_ip}, Protocol: {protocol}, Payload Length: {payload_len}"
-    )
-
-    # Kiểm tra điều kiện alert dựa trên payload length
+    # RULE-BASED DETECTION: Trigger an alert if payload is too large
     if payload_len > ALERT_THRESHOLD:
         ALERT_COUNT += 1
         logger.warning(
-            f"ALERT {ALERT_COUNT}: Suspicious packet detected! {src_ip} -> {dst_ip}, Payload Length: {payload_len}"
+            f"ALERT {ALERT_COUNT}: Suspicious packet! {src_ip} -> {dst_ip}, Payload Length: {payload_len}"
         )
 
-    # Dự đoán bằng mô hình (nếu có)
+    # ML-BASED DETECTION: Use trained model if available
     if model is not None:
         try:
-            # Chuẩn bị dữ liệu đầu vào cho model
+            # Prepare features for the model
             if MODEL_EXPECTED_FEATURES == 2:
+                # Example: Model trained on [protocol, payload_len]
                 X = np.array([[protocol, payload_len]], dtype=np.float32)
             else:
+                # Example: Model trained on raw payload byte values
                 payload_bytes = bytes(packet[Raw].load) if packet.haslayer(Raw) else b""
                 byte_values = list(payload_bytes)[:MODEL_EXPECTED_FEATURES]
-                byte_values += [0] * (MODEL_EXPECTED_FEATURES - len(byte_values))
+                byte_values += [0] * (
+                    MODEL_EXPECTED_FEATURES - len(byte_values)
+                )  # pad with zeros
                 X = np.array([byte_values], dtype=np.float32)
 
-            # Áp dụng scaler (nếu có)
+            # Apply scaler if available
             if scaler is not None:
                 X = scaler.transform(X)
 
-            # Dự đoán
+            # Predict with the model
             y_pred = model.predict(X)
             is_attack = bool(y_pred[0]) if hasattr(y_pred, "__iter__") else bool(y_pred)
 
@@ -115,7 +128,13 @@ def packet_callback(packet):
 
 # ================= Main =================
 def main():
-    load_model()  # Load model trước khi bắt traffic
+    """
+    Main entry point.
+    - Loads the ML model
+    - Asks user which network interface to sniff
+    - Starts sniffing until interrupted
+    """
+    load_model()  # Load model before starting traffic capture
 
     iface = input(
         "Enter the network interface to sniff (e.g., eth0, wlan0, lo): "

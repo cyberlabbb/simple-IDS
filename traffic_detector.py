@@ -4,7 +4,8 @@ import os
 import logging
 import joblib
 import numpy as np
-from scapy.all import sniff, IP, Raw, TCP, UDP
+from scapy.all import sniff, IP, TCP, UDP, Raw
+from tensorflow.keras.models import load_model
 from typing import Dict, Any
 
 # ================= Logging =================
@@ -23,121 +24,111 @@ logger = logging.getLogger(__name__)
 ALERT_THRESHOLD = 1000  # If payload length > this, trigger a simple rule-based alert
 PACKET_COUNT = 0
 ALERT_COUNT = 0
-MODEL_PATH = "rf_payload_model.joblib"
-MODEL_EXPECTED_FEATURES = None  # number of features the model expects
-FEATURE_LEN = 1444  # default number of bytes to use for raw-byte vectors
+MODEL_PATH = "rf_payload_model.joblib"  # Path to RandomForest model
+DL_MODEL_PATH = "deep_learning_payload_model.h5"  # Path to deep learning model
+SCALER_PATH = "scaler.joblib"  # Path to scaler (if used)
+FEATURE_LEN = 1444  # Default number of bytes for payload features
+HEADER_FEATURES = (
+    4  # Number of header features: src_port, dst_port, protocol, payload_len
+)
 model = None
 scaler = None
+use_deep_learning = False  # Flag to determine which model to use
 
 
 # ================= Load Model =================
-def load_model():
+def load_model_and_scaler():
     """
-    Load the trained ML model and optional scaler from a joblib file.
-    The joblib file should contain a dictionary with keys like 'model' and 'scaler'.
+    Load the trained ML/DL model and optional scaler.
     """
-    global model, scaler, MODEL_EXPECTED_FEATURES, FEATURE_LEN
+    global model, scaler, use_deep_learning, FEATURE_LEN
     try:
-        if not os.path.isfile(MODEL_PATH):
+        if os.path.isfile(DL_MODEL_PATH):
+            # Load deep learning model
+            model = load_model(DL_MODEL_PATH)
+            use_deep_learning = True
+            logger.info(f"✅ Deep learning model loaded: {DL_MODEL_PATH}")
+        elif os.path.isfile(MODEL_PATH):
+            # Load RandomForest model
+            saved = joblib.load(MODEL_PATH)
+            if isinstance(saved, dict):
+                model = saved.get("model", None)
+                scaler = saved.get("scaler", None)
+            else:
+                model = saved
+                scaler = None
+            use_deep_learning = False
+            logger.info(f"✅ RandomForest model loaded: {MODEL_PATH}")
+        else:
             logger.warning(
-                f"Model file not found: {MODEL_PATH}. Running with rule-based detection only."
+                "❌ No model file found. Running with rule-based detection only."
             )
             model = None
             scaler = None
-            MODEL_EXPECTED_FEATURES = None
-            FEATURE_LEN = 1444
             return
 
-        saved = joblib.load(MODEL_PATH)
-        # saved can be a dict {'model': ..., 'scaler': ...} or directly an estimator
-        if isinstance(saved, dict):
-            model = saved.get("model", None)
-            scaler = saved.get("scaler", None)
-        else:
-            model = saved
-            scaler = None
-
-        logger.info(f"✅ Model loaded: {MODEL_PATH}")
-
-        # Determine expected features
-        if hasattr(model, "n_features_in_"):
-            MODEL_EXPECTED_FEATURES = int(model.n_features_in_)
-        elif hasattr(model, "feature_names_in_"):
-            MODEL_EXPECTED_FEATURES = len(model.feature_names_in_)
-        else:
-            MODEL_EXPECTED_FEATURES = None
-
-        # Decide FEATURE_LEN (used for raw-byte vectors)
-        if MODEL_EXPECTED_FEATURES and MODEL_EXPECTED_FEATURES > 2:
-            FEATURE_LEN = MODEL_EXPECTED_FEATURES
-        else:
-            FEATURE_LEN = 1444  # fallback default
-
-        logger.info(
-            f"Model expects {MODEL_EXPECTED_FEATURES} features; using FEATURE_LEN={FEATURE_LEN}"
-        )
+        # Adjust FEATURE_LEN based on model input
+        if hasattr(model, "input_shape") and use_deep_learning:
+            FEATURE_LEN = model.input_shape[1] - HEADER_FEATURES
+        elif hasattr(model, "n_features_in_"):
+            FEATURE_LEN = model.n_features_in_ - HEADER_FEATURES
+        logger.info(f"Using FEATURE_LEN={FEATURE_LEN}")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         model = None
         scaler = None
-        MODEL_EXPECTED_FEATURES = None
-        FEATURE_LEN = 1444
 
 
 # ================= Feature Extraction =================
 def extract_features(packet) -> Dict[str, Any]:
     """
-    Extract features from a network packet and return:
-      {
-        "src_ip": str,
-        "dst_ip": str,
-        "protocol": int,
-        "payload_len": int,
-        "vector": List[int]  # fixed-length byte vector (len = FEATURE_LEN)
-      }
-
-    The 'vector' follows the same logic as benign_pcap_to_features:
-    take raw payload bytes, pad with zeros or truncate to FEATURE_LEN.
+    Extract features from a network packet, including:
+      - Header features: src_port, dst_port, protocol, payload_len
+      - Payload features: fixed-length byte vector (len = FEATURE_LEN)
     """
     global FEATURE_LEN
 
-    src_ip = "0.0.0.0"
-    dst_ip = "0.0.0.0"
+    # Default values
+    src_port = 0
+    dst_port = 0
     protocol = 0
     payload_len = 0
-    byte_vector = [0] * FEATURE_LEN  # default zero vector
+    byte_vector = [0] * FEATURE_LEN  # Default zero vector
 
     if packet is None:
         return {
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "protocol": protocol,
-            "payload_len": payload_len,
+            "header": [src_port, dst_port, protocol, payload_len],
             "vector": byte_vector,
         }
 
-    # IP layer
+    # Extract IP layer information
     if packet.haslayer(IP):
-        src_ip = packet[IP].src
-        dst_ip = packet[IP].dst
         protocol = int(packet[IP].proto)
 
-    # Raw payload
+    # Extract transport layer information
+    if packet.haslayer(TCP):
+        src_port = packet[TCP].sport
+        dst_port = packet[TCP].dport
+    elif packet.haslayer(UDP):
+        src_port = packet[UDP].sport
+        dst_port = packet[UDP].dport
+
+    # Extract Raw payload
     if packet.haslayer(Raw):
         payload_bytes = bytes(packet[Raw].load)
         payload_len = len(payload_bytes)
 
-        # convert to list of ints and pad/truncate to FEATURE_LEN
+        # Convert to list of ints and pad/truncate to FEATURE_LEN
         byte_list = list(payload_bytes[:FEATURE_LEN])
         if len(byte_list) < FEATURE_LEN:
             byte_list.extend([0] * (FEATURE_LEN - len(byte_list)))
         byte_vector = byte_list
 
+    # Combine header features
+    header_features = [src_port, dst_port, protocol, payload_len]
+
     return {
-        "src_ip": src_ip,
-        "dst_ip": dst_ip,
-        "protocol": protocol,
-        "payload_len": payload_len,
+        "header": header_features,
         "vector": byte_vector,
     }
 
@@ -146,69 +137,52 @@ def extract_features(packet) -> Dict[str, Any]:
 def packet_callback(packet):
     """
     Called per sniffed packet.
-    Uses rule-based detection and ML model (if loaded).
+    Uses rule-based detection and ML/DL model (if loaded).
     """
-    global PACKET_COUNT, ALERT_COUNT, model, scaler, MODEL_EXPECTED_FEATURES, FEATURE_LEN
+    global PACKET_COUNT, ALERT_COUNT, model, scaler, FEATURE_LEN
     PACKET_COUNT += 1
-    
-    
-    
-    if packet.haslayer(TCP) and (packet[TCP].dport == 80 or packet[TCP].dport == 443):
-        feats = extract_features(packet)
-        src_ip = feats["src_ip"]
-        dst_ip = feats["dst_ip"]
-        protocol = feats["protocol"]
-        payload_len = feats["payload_len"]
-        vector = feats["vector"]  # list[int] length FEATURE_LEN
 
-        # RULE-BASED DETECTION
-        if payload_len > ALERT_THRESHOLD:
-            ALERT_COUNT += 1
-            logger.warning(
-                f"ALERT {ALERT_COUNT}: Suspicious packet (rule)! {src_ip} -> {dst_ip}, proto={protocol}, payload_len={payload_len}"
-            )
+    feats = extract_features(packet)
+    header = feats["header"]  # Header features
+    vector = feats["vector"]  # Payload features
 
-        # ML-BASED DETECTION (if model available)
-        if model is not None:
-            try:
-                # If model expects exactly 2 features, use [protocol, payload_len]
-                if MODEL_EXPECTED_FEATURES == 2:
-                    X = np.array([[protocol, payload_len]], dtype=np.float32)
-                else:
-                    # Use raw-byte vector. Ensure length matches expected features:
-                    if (
-                        MODEL_EXPECTED_FEATURES is not None
-                        and MODEL_EXPECTED_FEATURES != FEATURE_LEN
-                    ):
-                        # If model expects different length, adjust:
-                        if MODEL_EXPECTED_FEATURES < FEATURE_LEN:
-                            X_vec = vector[:MODEL_EXPECTED_FEATURES]
-                        else:
-                            X_vec = vector + [0] * (MODEL_EXPECTED_FEATURES - FEATURE_LEN)
-                    else:
-                        X_vec = vector
-                    X = np.array([X_vec], dtype=np.float32)
+    # RULE-BASED DETECTION
+    if header[3] > ALERT_THRESHOLD:  # payload_len > ALERT_THRESHOLD
+        ALERT_COUNT += 1
+        logger.warning(
+            f"ALERT {ALERT_COUNT}: Suspicious packet (rule)! Src Port: {header[0]}, Dst Port: {header[1]}, Protocol: {header[2]}, Payload Len: {header[3]}"
+        )
 
-                # Apply scaler if provided
-                if scaler is not None:
-                    X = scaler.transform(X)
+    # ML/DL-BASED DETECTION (if model available)
+    if model is not None:
+        try:
+            # Combine header and payload features
+            X = np.array([header + vector], dtype=np.float32)
 
-                # Make prediction
+            # Apply scaler if RandomForest model is used
+            if scaler is not None and not use_deep_learning:
+                X = scaler.transform(X)
+
+            # Make prediction
+            if use_deep_learning:
+                y_pred = model.predict(X, verbose=0)
+                is_attack = y_pred[0][0] > 0.5
+            else:
                 y_pred = model.predict(X)
-                is_attack = bool(y_pred[0]) if hasattr(y_pred, "__iter__") else bool(y_pred)
+                is_attack = bool(y_pred[0])
 
-                if is_attack:
-                    ALERT_COUNT += 1
-                    logger.warning(
-                        f"ALERT {ALERT_COUNT}: ML detected attack! {src_ip} -> {dst_ip}, proto={protocol}, payload_len={payload_len}"
-                    )
-            except Exception as e:
-                logger.error(f"Prediction error: {e}")
+            if is_attack:
+                ALERT_COUNT += 1
+                logger.warning(
+                    f"ALERT {ALERT_COUNT}: ML detected attack! Src Port: {header[0]}, Dst Port: {header[1]}, Protocol: {header[2]}, Payload Len: {header[3]}"
+                )
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
 
 
 # ================= Main =================
 def main():
-    load_model()
+    load_model_and_scaler()
 
     iface = input(
         "Enter the network interface to sniff (e.g., eth0, wlan0, lo): "
@@ -219,7 +193,7 @@ def main():
 
     print(f"Starting packet sniffing on interface: {iface} (FEATURE_LEN={FEATURE_LEN})")
     try:
-        # sniff indefinitely until Ctrl-C
+        # Sniff indefinitely until Ctrl-C
         sniff(iface=iface, prn=packet_callback, store=False)
     except KeyboardInterrupt:
         print("\nStopping packet sniffing...")

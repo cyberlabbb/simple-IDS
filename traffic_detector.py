@@ -5,7 +5,6 @@ import logging
 import joblib
 import numpy as np
 from scapy.all import sniff, IP, TCP, UDP, Raw
-from tensorflow.keras.models import load_model
 from typing import Dict, Any
 
 # ================= Logging =================
@@ -24,54 +23,48 @@ logger = logging.getLogger(__name__)
 ALERT_THRESHOLD = 1000  # If payload length > this, trigger a simple rule-based alert
 PACKET_COUNT = 0
 ALERT_COUNT = 0
-MODEL_PATH = "rf_payload_model.joblib"  # Path to RandomForest model
-DL_MODEL_PATH = "deep_learning_payload_model.h5"  # Path to deep learning model
-SCALER_PATH = "scaler.joblib"  # Path to scaler (if used)
+MODEL_PATH = "rf_payload_model.joblib"  # Path to the RandomForest model
+SCALER_PATH = "scaler.joblib"  # Path to the scaler (if used)
 FEATURE_LEN = 1444  # Default number of bytes for payload features
 HEADER_FEATURES = (
     4  # Number of header features: src_port, dst_port, protocol, payload_len
 )
 model = None
 scaler = None
-use_deep_learning = False  # Flag to determine which model to use
 
 
 # ================= Load Model =================
-def load_model_and_scaler():
+def load_model():
     """
-    Load the trained ML/DL model and optional scaler.
+    Load the trained ML model and optional scaler from a joblib file.
     """
-    global model, scaler, use_deep_learning, FEATURE_LEN
+    global model, scaler, FEATURE_LEN
     try:
-        if os.path.isfile(DL_MODEL_PATH):
-            # Load deep learning model
-            model = load_model(DL_MODEL_PATH)
-            use_deep_learning = True
-            logger.info(f"✅ Deep learning model loaded: {DL_MODEL_PATH}")
-        elif os.path.isfile(MODEL_PATH):
-            # Load RandomForest model
-            saved = joblib.load(MODEL_PATH)
-            if isinstance(saved, dict):
-                model = saved.get("model", None)
-                scaler = saved.get("scaler", None)
-            else:
-                model = saved
-                scaler = None
-            use_deep_learning = False
-            logger.info(f"✅ RandomForest model loaded: {MODEL_PATH}")
-        else:
+        if not os.path.isfile(MODEL_PATH):
             logger.warning(
-                "❌ No model file found. Running with rule-based detection only."
+                f"Model file not found: {MODEL_PATH}. Running with rule-based detection only."
             )
             model = None
             scaler = None
             return
 
-        # Adjust FEATURE_LEN based on model input
-        if hasattr(model, "input_shape") and use_deep_learning:
-            FEATURE_LEN = model.input_shape[1] - HEADER_FEATURES
-        elif hasattr(model, "n_features_in_"):
-            FEATURE_LEN = model.n_features_in_ - HEADER_FEATURES
+        saved = joblib.load(MODEL_PATH)
+        if isinstance(saved, dict):
+            model = saved.get("model", None)
+            scaler = saved.get("scaler", None)
+        else:
+            model = saved
+            scaler = None
+
+        logger.info(f"✅ Model loaded: {MODEL_PATH}")
+
+        # Determine expected features
+        if hasattr(model, "n_features_in_"):
+            expected_features = int(model.n_features_in_)
+            FEATURE_LEN = expected_features - HEADER_FEATURES
+        else:
+            FEATURE_LEN = 1444  # Fallback default
+
         logger.info(f"Using FEATURE_LEN={FEATURE_LEN}")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
@@ -137,7 +130,7 @@ def extract_features(packet) -> Dict[str, Any]:
 def packet_callback(packet):
     """
     Called per sniffed packet.
-    Uses rule-based detection and ML/DL model (if loaded).
+    Uses rule-based detection and ML model (if loaded).
     """
     global PACKET_COUNT, ALERT_COUNT, model, scaler, FEATURE_LEN
     PACKET_COUNT += 1
@@ -153,23 +146,19 @@ def packet_callback(packet):
             f"ALERT {ALERT_COUNT}: Suspicious packet (rule)! Src Port: {header[0]}, Dst Port: {header[1]}, Protocol: {header[2]}, Payload Len: {header[3]}"
         )
 
-    # ML/DL-BASED DETECTION (if model available)
+    # ML-BASED DETECTION (if model available)
     if model is not None:
         try:
             # Combine header and payload features
             X = np.array([header + vector], dtype=np.float32)
 
-            # Apply scaler if RandomForest model is used
-            if scaler is not None and not use_deep_learning:
+            # Apply scaler if provided
+            if scaler is not None:
                 X = scaler.transform(X)
 
             # Make prediction
-            if use_deep_learning:
-                y_pred = model.predict(X, verbose=0)
-                is_attack = y_pred[0][0] > 0.5
-            else:
-                y_pred = model.predict(X)
-                is_attack = bool(y_pred[0])
+            y_pred = model.predict(X)
+            is_attack = bool(y_pred[0]) if hasattr(y_pred, "__iter__") else bool(y_pred)
 
             if is_attack:
                 ALERT_COUNT += 1
@@ -182,7 +171,7 @@ def packet_callback(packet):
 
 # ================= Main =================
 def main():
-    load_model_and_scaler()
+    load_model()
 
     iface = input(
         "Enter the network interface to sniff (e.g., eth0, wlan0, lo): "

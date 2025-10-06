@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import sys
+import os
 import logging
-from scapy.all import sniff, IP, TCP, Raw
 import joblib
 import numpy as np
+from scapy.all import sniff, IP, TCP, Raw
+from typing import Dict, Any
+import re
 
 # ================= Logging =================
 logging.basicConfig(
@@ -12,7 +15,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("alerts.log", encoding="utf-8"),
+        logging.FileHandler("traffic_alerts.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -20,138 +23,170 @@ logger = logging.getLogger(__name__)
 # ================= Globals =================
 PACKET_COUNT = 0
 ALERT_COUNT = 0
-MODEL_PATH = "rf_payload_model.joblib"
-MODEL_EXPECTED_FEATURES = None
+MODEL_PATH = "rf_payload_model.joblib"  # Path to the trained model
+FEATURE_LEN = 1444  # Default number of bytes for payload vector
+HEADER_FEATURES = 6  # Number of header features
+DEFAULT_SHELL_PATTERNS = [".ps1", ".exe", ".dll"]  # Patterns to detect in payload
+DEFAULT_BLACKLIST = ["192.168.90.105", "192.168.90.112"]  # Blacklisted IPs
 model = None
 scaler = None
 
 
 # ================= Load Model =================
 def load_model():
-    """Load trained ML model and optional scaler from joblib."""
-    global model, scaler, MODEL_EXPECTED_FEATURES
+    """
+    Load the trained ML model and optional scaler from a joblib file.
+    """
+    global model, scaler, FEATURE_LEN
     try:
+        if not os.path.isfile(MODEL_PATH):
+            logger.warning(
+                f"Model file not found: {MODEL_PATH}. Running with heuristic detection only."
+            )
+            model = None
+            scaler = None
+            return
+
         saved = joblib.load(MODEL_PATH)
-        model = saved.get("model")
-        scaler = saved.get("scaler", None)
+        if isinstance(saved, dict):
+            model = saved.get("model", None)
+            scaler = saved.get("scaler", None)
+        else:
+            model = saved
+            scaler = None
+
         logger.info(f"✅ Model loaded: {MODEL_PATH}")
 
+        # Adjust FEATURE_LEN based on model expectations
         if hasattr(model, "n_features_in_"):
-            MODEL_EXPECTED_FEATURES = int(model.n_features_in_)
-        elif hasattr(model, "feature_names_in_"):
-            MODEL_EXPECTED_FEATURES = len(model.feature_names_in_)
+            expected_features = int(model.n_features_in_)
+            FEATURE_LEN = expected_features - HEADER_FEATURES
         else:
-            MODEL_EXPECTED_FEATURES = 2
+            FEATURE_LEN = 1444  # Default fallback
 
-        logger.info(f"Model expects {MODEL_EXPECTED_FEATURES} features.")
+        logger.info(f"Using FEATURE_LEN={FEATURE_LEN}")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         model = None
         scaler = None
 
 
-# ================= HTTP Feature Extraction =================
-def extract_http_info(packet):
+# ================= Feature Extraction =================
+def extract_features(packet) -> Dict[str, Any]:
     """
-    Extract information from HTTP packets.
-    Returns dict: src_ip, dst_ip, method, host, uri, content.
+    Extract features from a network packet, including:
+      - Header features: src_port, dst_port, protocol, payload_len
+      - Payload features: fixed-length byte vector (len = FEATURE_LEN)
     """
-    if not packet.haslayer(IP) or not packet.haslayer(Raw):
-        return None
+    global FEATURE_LEN
 
-    try:
-        payload = packet[Raw].load.decode(errors="ignore")
-        # Check if this is HTTP
-        if not ("HTTP" in payload or "GET " in payload or "POST " in payload):
-            return None
+    # Default values
+    src_ip = "0.0.0.0"
+    dst_ip = "0.0.0.0"
+    src_port = 0
+    dst_port = 0
+    protocol = 0
+    payload_len = 0
+    byte_vector = [0] * FEATURE_LEN  # Default zero vector
+    payload_content = ""
 
-        lines = payload.split("\r\n")
-        method, uri, host = None, None, None
-
-        if len(lines) > 0:
-            first_line = lines[0]
-            if any(x in first_line for x in ["GET ", "POST ", "HEAD "]):
-                parts = first_line.split(" ")
-                if len(parts) >= 2:
-                    method = parts[0]
-                    uri = parts[1]
-
-        for line in lines:
-            if line.lower().startswith("host:"):
-                host = line.split(":", 1)[1].strip()
-                break
-
+    if packet is None:
         return {
-            "src_ip": packet[IP].src,
-            "dst_ip": packet[IP].dst,
-            "method": method,
-            "host": host,
-            "uri": uri,
-            "content": payload,
+            "header": [src_port, dst_port, protocol, payload_len],
+            "vector": byte_vector,
+            "payload_content": payload_content,
         }
-    except Exception:
-        return None
 
+    # Extract IP layer information
+    if packet.haslayer(IP):
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        protocol = int(packet[IP].proto)
 
-# ================= Detection Logic =================
-def detect_ps1(http_info):
-    """Return True if HTTP payload contains .ps1."""
-    if http_info is None:
-        return False
-    uri = (http_info.get("uri") or "").lower()
-    content = (http_info.get("content") or "").lower()
-    return ".ps1" in uri or ".ps1" in content
+    # Extract transport layer information
+    if packet.haslayer(TCP):
+        src_port = packet[TCP].sport
+        dst_port = packet[TCP].dport
 
+    # Extract Raw payload
+    if packet.haslayer(Raw):
+        payload_bytes = bytes(packet[Raw].load)
+        payload_len = len(payload_bytes)
+        payload_content = payload_bytes.decode("utf-8", errors="ignore")
 
-# ================= ML Prediction =================
-def predict_attack(packet):
-    """Use ML model to predict if packet is malicious."""
-    global model, scaler, MODEL_EXPECTED_FEATURES
+        # Convert to list of ints and pad/truncate to FEATURE_LEN
+        byte_list = list(payload_bytes[:FEATURE_LEN])
+        if len(byte_list) < FEATURE_LEN:
+            byte_list.extend([0] * (FEATURE_LEN - len(byte_list)))
+        byte_vector = byte_list
 
-    if model is None:
-        return False
+    # Combine header features
+    header_features = [src_port, dst_port, protocol, payload_len]
 
-    try:
-        # Use Raw payload bytes as input
-        payload_bytes = bytes(packet[Raw].load) if packet.haslayer(Raw) else b""
-        byte_values = list(payload_bytes)[:MODEL_EXPECTED_FEATURES]
-        if len(byte_values) < MODEL_EXPECTED_FEATURES:
-            byte_values += [0] * (MODEL_EXPECTED_FEATURES - len(byte_values))
-        X = np.array([byte_values], dtype=np.float32)
-
-        if scaler is not None:
-            X = scaler.transform(X)
-
-        y_pred = model.predict(X)
-        return bool(y_pred[0]) if hasattr(y_pred, "__iter__") else bool(y_pred)
-    except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        return False
+    return {
+        "header": header_features,
+        "vector": byte_vector,
+        "payload_content": payload_content,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+    }
 
 
 # ================= Packet Callback =================
 def packet_callback(packet):
-    global PACKET_COUNT, ALERT_COUNT
+    """
+    Called per sniffed packet.
+    Uses heuristic detection and ML model (if loaded) to classify packets.
+    """
+    global PACKET_COUNT, ALERT_COUNT, model, scaler
     PACKET_COUNT += 1
 
-    http_info = extract_http_info(packet)
-    if http_info is None:
-        return  # skip non-HTTP traffic
+    feats = extract_features(packet)
+    header = feats["header"]  # Header features
+    vector = feats["vector"]  # Payload features
+    payload_content = feats["payload_content"]  # Extracted payload content
+    src_ip = feats["src_ip"]
+    dst_ip = feats["dst_ip"]
 
-    if detect_ps1(http_info):
-        src, dst = http_info["src_ip"], http_info["dst_ip"]
-        uri = http_info.get("uri", "")
-        ALERT_COUNT += 1
-        logger.warning(
-            f"⚠️ ALERT {ALERT_COUNT}: Detected .ps1 in HTTP request {src} → {dst} | {uri}"
-        )
-
-        # Now apply AI model
-        if predict_attack(packet):
+    # HEURISTIC DETECTION
+    # 1. Shellcode pattern matching
+    for pattern in DEFAULT_SHELL_PATTERNS:
+        if re.search(pattern, payload_content, re.IGNORECASE):
             ALERT_COUNT += 1
             logger.warning(
-                f"🤖 AI ALERT {ALERT_COUNT}: Model detected malicious HTTP packet from {src} → {dst} | {uri}"
+                f"ALERT {ALERT_COUNT}: Shellcode pattern detected! Pattern: '{pattern}', Src IP: {src_ip}, Dst IP: {dst_ip}"
             )
+            return
+
+    # 2. Blacklist matching
+    if dst_ip in DEFAULT_BLACKLIST:
+        ALERT_COUNT += 1
+        logger.warning(
+            f"ALERT {ALERT_COUNT}: Blacklisted destination detected! Dst IP: {dst_ip}, Src IP: {src_ip}"
+        )
+        return
+
+    # ML-BASED DETECTION
+    if model is not None:
+        try:
+            # Combine header and payload features
+            X = np.array([header + vector], dtype=np.float32)
+
+            # Apply scaler if provided
+            if scaler is not None:
+                X = scaler.transform(X)
+
+            # Make prediction
+            y_pred = model.predict(X)
+            is_attack = bool(y_pred[0]) if hasattr(y_pred, "__iter__") else bool(y_pred)
+
+            if is_attack:
+                ALERT_COUNT += 1
+                logger.warning(
+                    f"ALERT {ALERT_COUNT}: ML detected attack! Src IP: {src_ip}, Dst IP: {dst_ip}, Protocol: {header[2]}"
+                )
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
 
 
 # ================= Main =================
@@ -165,13 +200,12 @@ def main():
         print("No interface specified. Exiting...")
         return
 
-    print(f"🔍 Starting HTTP sniffing on interface: {iface}")
-    print("💡 Only analyzing HTTP traffic (tcp port 80)...\n")
-
+    print(f"Starting real-time packet sniffing on interface: {iface}")
     try:
-        sniff(iface=iface, filter="tcp port 80", prn=packet_callback, store=False)
+        # Sniff indefinitely until Ctrl-C
+        sniff(iface=iface, prn=packet_callback, store=False)
     except KeyboardInterrupt:
-        print("\n🛑 Stopping sniffing...")
+        print("\nStopping packet sniffing...")
         logger.info(
             f"Stopped sniffing. Total packets: {PACKET_COUNT}, Alerts: {ALERT_COUNT}"
         )

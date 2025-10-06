@@ -26,23 +26,21 @@ DEFAULT_SHELL_PATTERNS = [".ps1", ".exe", "shellcode"]  # Patterns to detect in 
 
 
 # ================= Feature Extraction =================
+# ================= Feature Extraction =================
 def extract_features(packet) -> Dict[str, Any]:
     """
     Extract features from a network packet, including:
       - Header features: src_port, dst_port, protocol, payload_len
-      - Payload content for pattern matching
     """
     # Default values
     src_port = 0
     dst_port = 0
     protocol = 0
     payload_len = 0
-    payload_content = ""
 
     if packet is None:
         return {
             "header": [src_port, dst_port, protocol, payload_len],
-            "payload_content": payload_content,
         }
 
     # Extract IP layer information
@@ -53,22 +51,16 @@ def extract_features(packet) -> Dict[str, Any]:
     if packet.haslayer(TCP):
         src_port = packet[TCP].sport
         dst_port = packet[TCP].dport
-    elif packet.haslayer(UDP):
-        src_port = packet[UDP].sport
-        dst_port = packet[UDP].dport
 
-    # Extract Raw payload
+    # Extract Raw payload length
     if packet.haslayer(Raw):
-        payload_bytes = bytes(packet[Raw].load)
-        payload_len = len(payload_bytes)
-        payload_content = payload_bytes.decode("utf-8", errors="ignore")
+        payload_len = len(bytes(packet[Raw].load))
 
     # Combine header features
     header_features = [src_port, dst_port, protocol, payload_len]
 
     return {
         "header": header_features,
-        "payload_content": payload_content,
     }
 
 
@@ -76,30 +68,22 @@ def extract_features(packet) -> Dict[str, Any]:
 def packet_callback(packet):
     """
     Called per sniffed packet.
-    Uses rule-based detection and shellcode pattern matching.
+    Filters and processes only HTTP packets (TCP port 80).
     """
     global PACKET_COUNT, ALERT_COUNT
     PACKET_COUNT += 1
 
-    feats = extract_features(packet)
-    header = feats["header"]  # Header features
-    payload_content = feats["payload_content"]  # Extracted payload content
+    # Filter HTTP packets (TCP port 80)
+    if packet.haslayer(TCP) and packet[TCP].dport == 80:
+        feats = extract_features(packet)
+        header = feats["header"]  # Header features
 
-    # RULE-BASED DETECTION
-    if header[3] > ALERT_THRESHOLD:  # payload_len > ALERT_THRESHOLD
-        ALERT_COUNT += 1
-        logger.warning(
-            f"ALERT {ALERT_COUNT}: Suspicious packet (rule)! Src Port: {header[0]}, Dst Port: {header[1]}, Protocol: {header[2]}, Payload Len: {header[3]}"
-        )
-
-    # SHELLCODE PATTERN DETECTION
-    for pattern in DEFAULT_SHELL_PATTERNS:
-        if pattern in payload_content:
+        # RULE-BASED DETECTION
+        if header[3] > ALERT_THRESHOLD:  # payload_len > ALERT_THRESHOLD
             ALERT_COUNT += 1
             logger.warning(
-                f"ALERT {ALERT_COUNT}: Shellcode pattern detected! Pattern: '{pattern}', Src Port: {header[0]}, Dst Port: {header[1]}, Protocol: {header[2]}"
+                f"ALERT {ALERT_COUNT}: Suspicious HTTP packet! Src Port: {header[0]}, Dst Port: {header[1]}, Protocol: {header[2]}, Payload Len: {header[3]}"
             )
-            break
 
 
 # ================= Main =================

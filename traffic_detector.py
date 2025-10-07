@@ -25,7 +25,6 @@ PACKET_COUNT = 0
 ALERT_COUNT = 0
 MODEL_PATH = "rf_payload_model.joblib"  # Path to the trained model
 FEATURE_LEN = 1444  # Default number of bytes for payload vector
-HEADER_FEATURES = 6  # Number of header features
 DEFAULT_SHELL_PATTERNS = [".ps1", ".exe", ".dll"]  # Patterns to detect in payload
 DEFAULT_BLACKLIST = ["192.168.90.105", "192.168.90.112"]  # Blacklisted IPs
 model = None
@@ -55,16 +54,15 @@ def load_model():
             model = saved
             scaler = None
 
-        logger.info(f"✅ Model loaded: {MODEL_PATH}")
+        logger.info(f"✅ Model loaded successfully from: {MODEL_PATH}")
 
-        # Adjust FEATURE_LEN based on model expectations
+        # Adjust FEATURE_LEN dynamically based on model structure
         if hasattr(model, "n_features_in_"):
-            expected_features = int(model.n_features_in_)
-            FEATURE_LEN = expected_features - HEADER_FEATURES
+            FEATURE_LEN = int(model.n_features_in_)
         else:
-            FEATURE_LEN = 1444  # Default fallback
+            FEATURE_LEN = 1444  # Fallback default
 
-        logger.info(f"Using FEATURE_LEN={FEATURE_LEN}")
+        logger.info(f"Expected model input size: {FEATURE_LEN} features")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         model = None
@@ -74,61 +72,46 @@ def load_model():
 # ================= Feature Extraction =================
 def extract_features(packet) -> Dict[str, Any]:
     """
-    Extract features from a network packet, including:
-      - Header features: src_port, dst_port, protocol, payload_len
-      - Payload features: fixed-length byte vector (len = FEATURE_LEN)
+    Extracts payload bytes from packets and converts them into a fixed-length vector.
     """
     global FEATURE_LEN
 
-    # Default values
     src_ip = "0.0.0.0"
     dst_ip = "0.0.0.0"
-    src_port = 0
-    dst_port = 0
     protocol = 0
-    payload_len = 0
-    byte_vector = [0] * FEATURE_LEN  # Default zero vector
     payload_content = ""
+    byte_vector = [0] * FEATURE_LEN  # Default zero vector
 
     if packet is None:
         return {
-            "header": [src_port, dst_port, protocol, payload_len],
             "vector": byte_vector,
             "payload_content": payload_content,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
         }
 
-    # Extract IP layer information
+    # Extract IP info
     if packet.haslayer(IP):
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst
         protocol = int(packet[IP].proto)
 
-    # Extract transport layer information
-    if packet.haslayer(TCP):
-        src_port = packet[TCP].sport
-        dst_port = packet[TCP].dport
-
-    # Extract Raw payload
+    # Extract payload
     if packet.haslayer(Raw):
         payload_bytes = bytes(packet[Raw].load)
-        payload_len = len(payload_bytes)
         payload_content = payload_bytes.decode("utf-8", errors="ignore")
 
-        # Convert to list of ints and pad/truncate to FEATURE_LEN
         byte_list = list(payload_bytes[:FEATURE_LEN])
         if len(byte_list) < FEATURE_LEN:
             byte_list.extend([0] * (FEATURE_LEN - len(byte_list)))
         byte_vector = byte_list
 
-    # Combine header features
-    header_features = [src_port, dst_port, protocol, payload_len]
-
     return {
-        "header": header_features,
         "vector": byte_vector,
         "payload_content": payload_content,
         "src_ip": src_ip,
         "dst_ip": dst_ip,
+        "protocol": protocol,
     }
 
 
@@ -136,20 +119,20 @@ def extract_features(packet) -> Dict[str, Any]:
 def packet_callback(packet):
     """
     Called per sniffed packet.
-    Uses heuristic detection and ML model (if loaded) to classify packets.
+    Performs heuristic and ML-based anomaly detection.
     """
     global PACKET_COUNT, ALERT_COUNT, model, scaler
     PACKET_COUNT += 1
 
     feats = extract_features(packet)
-    header = feats["header"]  # Header features
-    vector = feats["vector"]  # Payload features
-    payload_content = feats["payload_content"]  # Extracted payload content
+    vector = feats["vector"]
+    payload_content = feats["payload_content"]
     src_ip = feats["src_ip"]
     dst_ip = feats["dst_ip"]
+    protocol = feats["protocol"]
 
-    # HEURISTIC DETECTION
-    # 1. Shellcode pattern matching
+    # ---- Heuristic Detection ----
+    # 1. Detect suspicious patterns
     for pattern in DEFAULT_SHELL_PATTERNS:
         if re.search(pattern, payload_content, re.IGNORECASE):
             ALERT_COUNT += 1
@@ -158,7 +141,7 @@ def packet_callback(packet):
             )
             return
 
-    # 2. Blacklist matching
+    # 2. Blacklist detection
     if dst_ip in DEFAULT_BLACKLIST:
         ALERT_COUNT += 1
         logger.warning(
@@ -166,24 +149,28 @@ def packet_callback(packet):
         )
         return
 
-    # ML-BASED DETECTION
+    # ---- ML Detection ----
     if model is not None:
         try:
-            # Combine header and payload features
             X = np.array([vector], dtype=np.float32)
 
-            # Apply scaler if provided
+            # Validate input size
+            if X.shape[1] != model.n_features_in_:
+                logger.error(
+                    f"⚠️ Feature length mismatch: got {X.shape[1]}, expected {model.n_features_in_}"
+                )
+                return
+
             if scaler is not None:
                 X = scaler.transform(X)
 
-            # Make prediction
             y_pred = model.predict(X)
             is_attack = bool(y_pred[0]) if hasattr(y_pred, "__iter__") else bool(y_pred)
 
             if is_attack:
                 ALERT_COUNT += 1
                 logger.warning(
-                    f"ALERT {ALERT_COUNT}: ML detected attack! Src IP: {src_ip}, Dst IP: {dst_ip}, Protocol: {header[2]}"
+                    f"ALERT {ALERT_COUNT}: 🚨 ML detected attack! Src IP: {src_ip}, Dst IP: {dst_ip}, Protocol: {protocol}"
                 )
         except Exception as e:
             logger.error(f"Prediction error: {e}")
@@ -202,7 +189,6 @@ def main():
 
     print(f"Starting real-time packet sniffing on interface: {iface}")
     try:
-        # Sniff indefinitely until Ctrl-C
         sniff(iface=iface, prn=packet_callback, store=False)
     except KeyboardInterrupt:
         print("\nStopping packet sniffing...")

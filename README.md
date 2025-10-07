@@ -4,7 +4,7 @@ This Python script captures network packets in real-time and uses a pre-trained 
 It extracts payload bytes from packets, converts them into numerical feature vectors, and classifies them using a Random Forest model (`rf_payload_model.joblib`).
 
 ---
-
+![alt text](image.png)
 ## 📋 Features
 
 - Real-time packet sniffing using **Scapy**

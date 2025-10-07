@@ -25,8 +25,6 @@ PACKET_COUNT = 0
 ALERT_COUNT = 0
 MODEL_PATH = "rf_payload_model.joblib"  # Path to the trained model
 FEATURE_LEN = 1444  # Default number of bytes for payload vector
-DEFAULT_SHELL_PATTERNS = [".ps1", ".exe", ".dll"]  # Patterns to detect in payload
-DEFAULT_BLACKLIST = ["192.168.90.105", "192.168.90.112"]  # Blacklisted IPs
 model = None
 scaler = None
 
@@ -130,24 +128,6 @@ def packet_callback(packet):
     src_ip = feats["src_ip"]
     dst_ip = feats["dst_ip"]
     protocol = feats["protocol"]
-
-    # # ---- Heuristic Detection ----
-    # # 1. Detect suspicious patterns
-    # for pattern in DEFAULT_SHELL_PATTERNS:
-    #     if re.search(pattern, payload_content, re.IGNORECASE):
-    #         ALERT_COUNT += 1
-    #         logger.warning(
-    #             f"ALERT {ALERT_COUNT}: Shellcode pattern detected! Pattern: '{pattern}', Src IP: {src_ip}, Dst IP: {dst_ip}"
-    #         )
-    #         return
-
-    # # 2. Blacklist detection
-    # if dst_ip in DEFAULT_BLACKLIST:
-    #     ALERT_COUNT += 1
-    #     logger.warning(
-    #         f"ALERT {ALERT_COUNT}: Blacklisted destination detected! Dst IP: {dst_ip}, Src IP: {src_ip}"
-    #     )
-    #     return
 
     # ---- ML Detection ----
     if model is not None:

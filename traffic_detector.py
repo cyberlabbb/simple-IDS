@@ -142,6 +142,7 @@ def packet_callback(packet):
     PACKET_COUNT += 1
 
     feats = extract_features(packet)
+    header = feats["header"]  # Header features
     vector = feats["vector"]  # Payload features
     payload_content = feats["payload_content"]  # Extracted payload content
     src_ip = feats["src_ip"]
